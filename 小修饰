@@ -1,0 +1,590 @@
+{
+  "nbformat": 4,
+  "nbformat_minor": 0,
+  "metadata": {
+    "colab": {
+      "name": "site_SVM.ipynb",
+      "provenance": [],
+      "collapsed_sections": [],
+      "authorship_tag": "ABX9TyNMwNLIHC90otuAdgY6QQ9r"
+    },
+    "kernelspec": {
+      "name": "python3",
+      "display_name": "Python 3"
+    },
+    "language_info": {
+      "name": "python"
+    }
+  },
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "source": [
+        "# 使用SVM预测donor位点\n",
+        "> 生科登峰1901班，吴思承\n",
+        ">\n",
+        "> U201912536"
+      ],
+      "metadata": {
+        "id": "vEBRvynSODF9"
+      }
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "## 概述\n",
+        "真核生物的基因包含外显子和内含子，在转录完成后，需要进行加工，选择性地将外显子连接起来，最终得到成熟的mRNA。而研究显示，在内含子与外显子的边界上，存在保守的剪接位点。其中，我们将位于内含子左侧（5'端）的剪接位点称为供体（donor），而位于内含子右侧（3'端）的剪接位点称为受体（acceptor）。\n",
+        "\n",
+        "在基因预测工作中，研究人员往往需要明确DNA中实际编码蛋白质的部分。此时便需要预测RNA上的选择性剪接方式，而作为内含子边界上的保守序列，donor位点的识别对内含子、外显子的位置、数量的确定有着巨大的用处。\n",
+        "\n",
+        "预测donor位点的方法包括WMM、WAM到SVN、神经网络等，颇为丰富。本上机报告选择实现其中的SVM模型，并对其实际预测效果进行评估。"
+      ],
+      "metadata": {
+        "id": "EBPoPjhZOFIu"
+      }
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "## 方法"
+      ],
+      "metadata": {
+        "id": "w4yl9rQMOLwi"
+      }
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "### SVM的原理\n",
+        "包括LSVM在内的线性分类器在训练时试图在样本空间内寻找一个超平面，将训练数据阳性和阴性样本区分开。根据新样本与超平面的位置关系，进行分类判别。但是这一方法仅适用于样本本身线性可分的情况，若样本线性不可分，则传统的线性分类器难以得到好的结果。\n",
+        "\n",
+        "SVM将数据样本视为特征空间中的点（或向量），使用核函数，将相对低维的点映射到更高维空间中，使得原本线性不可分的样本变得线性可分。之后再在高维特征空间中寻找超平面，实现分类。"
+      ],
+      "metadata": {
+        "id": "-gE_eQhKONAV"
+      }
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "### 依赖加载与数据挂载\n",
+        "与先前的WAM上机任务类似，在本次上机中，本人同样使用Python（Jupyter Notebook）实现SVM模型。代码在Google Colab的云服务上运行，数据存储在账号对应的Google Drive中。\n",
+        "\n",
+        "调用的依赖库中，``os``用于读取文件，``re``用于正则表达式辨别数据中的外显子信息，``random``提供随机采样函数，``matplotlib``用于绘制图像，``tqdm``用于生成数据读取的进度条，``sklearn``用于提供现成的模型性能评估方法和SVM实现。"
+      ],
+      "metadata": {
+        "id": "PiXlYxczOOxn"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "import os\n",
+        "import re\n",
+        "import random\n",
+        "import numpy as np\n",
+        "import matplotlib.pyplot as plt\n",
+        "from tqdm import tqdm\n",
+        "from sklearn.svm import SVC\n",
+        "from sklearn.metrics import roc_curve, auc, f1_score, confusion_matrix\n",
+        "\n",
+        "# 挂载Google Drive\n",
+        "from google.colab import drive\n",
+        "drive.mount('/content/drive')\n",
+        "\n",
+        "# 数据储存路径\n",
+        "training_path = '/content/drive/MyDrive/Collab Files/donor_dataset/training'\n",
+        "testing_path = '/content/drive/MyDrive/Collab Files/donor_dataset/testing'\n"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "dFnzO9hOOiZU",
+        "outputId": "648a4f75-dfd4-41ea-b10d-e6a3248a8532"
+      },
+      "execution_count": 1,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Mounted at /content/drive\n"
+          ]
+        }
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "### 从数据集中提取序列片段\n",
+        "与WAM不同，SVM不仅仅通过统计donor位点附近的碱基分布来构建打分表，而是需要同时使用阳性样本和阴性样本的序列片段来构建判别器。因此需要对训练数据中的各种序列片段进行提取。\n",
+        "\n",
+        "下面的``get_sequence``函数重复使用了WAM上机任务中的代码。"
+      ],
+      "metadata": {
+        "id": "ImRIJJrLPzUG"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# get_sequence：从数据集中提取需要的序列片段\n",
+        "def get_sequence(file_path, k1=4, k2=4, type='positive'):\n",
+        "    sequence_list = []\n",
+        "\n",
+        "    # 逐个读取文件\n",
+        "    print('Handling files in \\'' + file_path + '\\' ...')\n",
+        "    for data_file in tqdm(os.listdir(file_path)):\n",
+        "        with open(file_path + '/' + data_file, 'r') as FILE:\n",
+        "            lines = FILE.readlines()\n",
+        "            sequence = ''.join(lines[2:]).replace('\\n', '').lower()\n",
+        "            donor_sites = re.findall('(\\d+)(?=,)', lines[1])\n",
+        "\n",
+        "            # 输出阳性样本\n",
+        "            if type == 'positive':\n",
+        "                for site in donor_sites:\n",
+        "                    site_num = eval(site)\n",
+        "                    subsequence = sequence[site_num - k1 - 1:site_num + k2]\n",
+        "\n",
+        "                    if (set(subsequence) | {'a', 't', 'c', 'g'}) != {'a', 't', 'c', 'g'}:\n",
+        "                        continue\n",
+        "\n",
+        "                    sequence_list.append(subsequence)\n",
+        "\n",
+        "            # 输出阴性样本\n",
+        "            else:\n",
+        "                window_size = k1 + k2 + 1\n",
+        "                seq_len = len(sequence)\n",
+        "\n",
+        "                for i in range(seq_len - window_size + 1):\n",
+        "                    subsequence = sequence[i:i + window_size]\n",
+        "\n",
+        "                    if (set(subsequence) | {'a', 't', 'c', 'g'}) != {'a', 't', 'c', 'g'} \\\n",
+        "                       or str(i + k1 + 1) in donor_sites:\n",
+        "                        continue\n",
+        "                    \n",
+        "                    sequence_list.append(subsequence)\n",
+        "\n",
+        "    return sequence_list"
+      ],
+      "metadata": {
+        "id": "LMkH4TujP3jD"
+      },
+      "execution_count": 2,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "### 对序列进行one-hot编码\n",
+        "由于SVM将样本序列视为高维空间中的一个点（向量），用0~3的数字来表示某一位置上的碱基将会引入原始数据中不存在的位置关系，可能会对模型产生负面影响。因此，有必要对碱基进行one-hot编码（独热编码），将离散的碱基映射到欧氏空间中，并确保不同碱基之间的距离相同，以便后续训练。\n",
+        "\n",
+        "函数``one_hot_sequence``将输入的序列处理为one-hot编码的numpy数组，输出的数组长度将会是输入序列长度的4倍。\n",
+        "\n",
+        "碱基到one-hot编码的映射关系储存在字典``nucleotide_to_array``中。与WAM中的处理方法类似，表示不确定碱基的``n``、``b``等将会被直接忽略。"
+      ],
+      "metadata": {
+        "id": "Ul6qxC7dQ_pu"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# nucleotide_to_array：提供从碱基到one-hot编码的映射关系\n",
+        "nucleotide_to_array = {\n",
+        "    'a': np.array([1, 0, 0, 0], dtype=float),\n",
+        "    't': np.array([0, 1, 0, 0], dtype=float),\n",
+        "    'c': np.array([0, 0, 1, 0], dtype=float),\n",
+        "    'g': np.array([0, 0, 0, 1], dtype=float)\n",
+        "}\n",
+        "\n",
+        "print('nucleotide_to_array: ', nucleotide_to_array)"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "tvuA_R2tTH0c",
+        "outputId": "fe74e212-adf0-4e47-a6f1-9e587a9dd03e"
+      },
+      "execution_count": 3,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "nucleotide_to_array:  {'a': array([1., 0., 0., 0.]), 't': array([0., 1., 0., 0.]), 'c': array([0., 0., 1., 0.]), 'g': array([0., 0., 0., 1.])}\n"
+          ]
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# one_hot_sequence：将序列处理为one-hot编码的数组\n",
+        "def one_hot_sequence(sequence, nucleotide_to_array=nucleotide_to_array):\n",
+        "    one_hot_list = [nucleotide_to_array[nt] for nt in sequence]\n",
+        "    one_hot_array = np.array(one_hot_list).reshape(-1)\n",
+        "    return one_hot_array"
+      ],
+      "metadata": {
+        "id": "3L3tAjZATxh8"
+      },
+      "execution_count": 4,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "### 构建数据集\n",
+        "结合前面的两个函数，按照需要构建one-hot编码完毕的数据集，用于训练和验证。\n",
+        "\n",
+        "函数``build_dataset``返回两个列表``data_list``和``data_class``，分别储存编码后的样本序列和样本的类型（是否是donor位点附近序列）。输入中的``pos_num``和``neg_num``为数据集中阳性样本和阴性样本的数量，为默认值``None``或大于样本总数时输出全部样本。"
+      ],
+      "metadata": {
+        "id": "ESMBXmgvWhkC"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# build_dataset：构建数据集\n",
+        "def build_dataset(file_path, pos_num=None, neg_num=None, k1=4, k2=4):\n",
+        "    # 从训练用文件中提取所有的序列\n",
+        "    positive_seq = get_sequence(file_path, k1, k2, 'positive')\n",
+        "    negative_seq = get_sequence(file_path, k1, k2, 'negative')\n",
+        "\n",
+        "    # 随机选取pos_num个阳性样本\n",
+        "    if pos_num != None and pos_num < len(positive_seq):\n",
+        "        index = random.sample(range(len(positive_seq)), pos_num)\n",
+        "        positive_list = [one_hot_sequence(positive_seq[i]) for i in index]\n",
+        "    else:\n",
+        "        positive_list = [one_hot_sequence(seq) for seq in positive_seq]\n",
+        "    \n",
+        "    # 随机选取neg_num个阴性样本\n",
+        "    if neg_num != None and neg_num < len(negative_seq):\n",
+        "        index = random.sample(range(len(negative_seq)), neg_num)\n",
+        "        negative_list = [one_hot_sequence(negative_seq[i]) for i in index]\n",
+        "    else:\n",
+        "        negative_list = [one_hot_sequence(seq) for seq in negative_seq]\n",
+        "\n",
+        "    # 合并成训练集\n",
+        "    data_list = positive_list + negative_list\n",
+        "    data_class = [1] * len(positive_list) + [0] * len(negative_list)\n",
+        "\n",
+        "    return data_list, data_class"
+      ],
+      "metadata": {
+        "id": "HaoKzc1mXfv3"
+      },
+      "execution_count": 5,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "### 构建SVM模型\n",
+        "使用现有的``sklearn.svm.SVC``构建SVM模型，并进行训练。\n",
+        "\n",
+        "函数``build_svm``输入训练集和核函数类型，返回训练完毕的SVM分类器。其中核函数参数``kernel``默认为``'rbf'``，即高斯核（径向基函数核）。考虑到训练数据中阳性和阴性样本数量可能极其不均衡，参数``class_weight``设置为``'balanced'``，根据类别比例自动设置惩罚参数。``sklearn.svm.SVC``的其余参数均使用默认值。"
+      ],
+      "metadata": {
+        "id": "stUFAahPa3zO"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# build_svm：构建模型并训练，返回训练完毕的模型\n",
+        "def build_svm(train_x, train_y, kernel='rbf'):\n",
+        "    classifier = SVC(kernel=kernel, class_weight='balanced')\n",
+        "    classifier.fit(train_x, train_y)\n",
+        "    return classifier"
+      ],
+      "metadata": {
+        "id": "bPM2SXs_ajNE"
+      },
+      "execution_count": 6,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "### 滑动窗口识别序列中的donor位点\n",
+        "对于一段给定的序列，使用滑动窗口法，对序列中的每一个位点周围的片段进行SVM分类，但由于SVM无法辨别经验上的高度保守。该部分代码也与WAM的类似。\n",
+        "\n",
+        "使用函数``search_donor_site``实现这一功能。参数中``k1``、``k2``与``nucleotide_frequency_count``中相同，为位点前后纳入判别的碱基数量。函数输出一个列表，其中包含了可能的donor位点的位置，下标从1开始。"
+      ],
+      "metadata": {
+        "id": "TZ4utPl1m9ty"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# search_donor_site：查找序列中的donor位点\n",
+        "def search_donor_site(sequence, classifier, k1=4, k2=4):\n",
+        "    donor_site = []\n",
+        "    window_size = k1 + k2 + 1\n",
+        "    seq_len = len(sequence)\n",
+        "\n",
+        "    # 滑动窗口判断donor位点\n",
+        "    for i in range(seq_len - window_size + 1):\n",
+        "        subsequence = sequence[i:i + window_size]\n",
+        "        \n",
+        "        # 跳过包含不确定碱基的片段\n",
+        "        if (set(subsequence) | {'a', 't', 'c', 'g'}) != {'a', 't', 'c', 'g'}:\n",
+        "            continue\n",
+        "\n",
+        "        # 将SVM判断为donor位点，且符合经验的位置加入结果列表\n",
+        "        subseq_array = one_hot_sequence(subsequence).reshape(1, -1)\n",
+        "        if classifier.predict(subseq_array)[0] == 1 and subsequence[5:7] == 'gt':\n",
+        "            donor_site.append(i + k1 + 1)\n",
+        "    \n",
+        "    return donor_site"
+      ],
+      "metadata": {
+        "id": "jysueivlnSxV"
+      },
+      "execution_count": 7,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "## 结果\n",
+        "### 模型训练\n",
+        "使用训练集中的序列构建训练集，并分别训练使用线性核函数的SVM和使用高斯核的SVM。命名为``classifier_linear``和``classifier_rbf``。\n",
+        "\n",
+        "由于阴性样本数量过大，将其数量限制在100000。相对而言，使用高斯核的SVM需要更长的时间训练。"
+      ],
+      "metadata": {
+        "id": "xDpvlaPpeFud"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# 构建训练集\n",
+        "train_list, train_class = build_dataset(training_path, neg_num=100000)\n",
+        "\n",
+        "# 训练SVM\n",
+        "classifier_linear = build_svm(train_list, train_class, kernel='linear')\n",
+        "classifier_rbf = build_svm(train_list, train_class, kernel='rbf')"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "5zEeYiSPdxNZ",
+        "outputId": "a24a8787-ee0b-4cc2-ddd6-4ab22bb6b4f3"
+      },
+      "execution_count": 8,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Handling files in '/content/drive/MyDrive/Collab Files/donor_dataset/training' ...\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "100%|██████████| 462/462 [00:03<00:00, 124.96it/s]\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Handling files in '/content/drive/MyDrive/Collab Files/donor_dataset/training' ...\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "100%|██████████| 462/462 [00:10<00:00, 45.35it/s]\n"
+          ]
+        }
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "### 进行预测\n",
+        "从验证集中选取一个文件为例。分别使用线性核与高斯核通过``search_donor_site``函数对序列中的donor位点进行预测，以确认算法能否正常运行。\n",
+        "\n",
+        "可以看出，虽然依旧存在一定量的假阳性，但是高斯核有着优于线性核的结果。"
+      ],
+      "metadata": {
+        "id": "nOBXgAEunrpZ"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# 选取一个文件，从中得到序列\n",
+        "file_path = testing_path + '/ACU08131.TXT'\n",
+        "\n",
+        "with open(file_path, 'r') as FILE:\n",
+        "    lines = FILE.readlines()\n",
+        "    sequence = ''.join(lines[2:]).replace('\\n', '').lower()\n",
+        "    \n",
+        "    # 提取出实际的donor位点\n",
+        "    donor_sites = re.findall('(\\d+)(?=,)', lines[1])\n",
+        "    \n",
+        "    # 预测donor位点\n",
+        "    predict_donor_linear = search_donor_site(sequence, classifier_linear)\n",
+        "    predict_donor_rbf = search_donor_site(sequence, classifier_rbf)\n",
+        "\n",
+        "    print('Actural donor sites: \\n[', ', '.join(donor_sites) + ']', sep='')\n",
+        "    print('Predicted donor sites (by \\'classifier_linear\\'): \\n', predict_donor_linear, sep='')\n",
+        "    print('Predicted donor sites (by \\'classifier_rbf\\'): \\n', predict_donor_rbf, sep='')"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "HQMCdLcDntcg",
+        "outputId": "b18ae844-ae21-4ab3-b190-cf82ba72131c"
+      },
+      "execution_count": 9,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Actural donor sites: \n",
+            "[641, 1362, 2028, 2802, 3797]\n",
+            "Predicted donor sites (by 'classifier_linear'): \n",
+            "[12, 69, 115, 135, 157, 264, 295, 321, 325, 363, 386, 462, 501, 532, 550, 641, 709, 749, 789, 812, 823, 844, 848, 860, 868, 879, 881, 924, 982, 993, 999, 1008, 1023, 1077, 1142, 1172, 1178, 1229, 1254, 1262, 1327, 1362, 1419, 1436, 1440, 1522, 1602, 1653, 1734, 1824, 1859, 1885, 1933, 1957, 1981, 2028, 2034, 2039, 2078, 2133, 2178, 2211, 2244, 2259, 2349, 2387, 2437, 2456, 2497, 2502, 2536, 2546, 2597, 2636, 2676, 2689, 2701, 2781, 2797, 2802, 2806, 2822, 2839, 2877, 2985, 2989, 3010, 3041, 3223, 3335, 3404, 3426, 3513, 3557, 3608, 3620, 3623, 3779, 3797, 3817, 3824, 3832, 3870, 3896, 3898, 3906, 3913, 3981, 3983, 4037, 4134, 4166, 4208, 4305, 4451, 4503, 4511, 4562, 4589, 4686, 4718, 4865, 4919, 4970, 4991, 5025, 5169, 5175, 5285, 5312, 5323, 5344, 5360, 5375]\n",
+            "Predicted donor sites (by 'classifier_rbf'): \n",
+            "[12, 69, 115, 157, 325, 386, 462, 501, 532, 641, 709, 789, 812, 844, 881, 924, 982, 993, 1008, 1023, 1077, 1172, 1178, 1229, 1254, 1262, 1272, 1362, 1522, 1602, 1653, 1734, 1824, 1859, 1981, 1993, 2028, 2034, 2078, 2103, 2133, 2178, 2211, 2244, 2259, 2349, 2379, 2387, 2437, 2456, 2497, 2502, 2597, 2636, 2676, 2689, 2701, 2797, 2802, 2806, 2817, 2822, 2839, 2877, 2989, 3010, 3041, 3223, 3335, 3557, 3620, 3623, 3797, 3824, 3832, 3845, 3870, 3898, 3906, 3913, 3983, 4037, 4134, 4166, 4208, 4305, 4451, 4503, 4511, 4562, 4589, 4686, 4718, 4865, 4919, 4991, 5025, 5169, 5175, 5312, 5323, 5344, 5360]\n"
+          ]
+        }
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "## 讨论\n",
+        "从验证集中提取阳性donor样本和阴性donor样本，并使用高斯核SVM进行预测，用于后续分析。\n",
+        "\n",
+        "与训练集一样，运行时间起见，阴性样本的数量被控制在100000条。"
+      ],
+      "metadata": {
+        "id": "5PpdmajYr46j"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "test_list, test_class = build_dataset(testing_path, neg_num=100000)\n",
+        "test_pred = classifier_rbf.predict(test_list)"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "NiKrMidde5Ha",
+        "outputId": "0bd23ead-b01a-4b91-aa6c-3bf8a233f78e"
+      },
+      "execution_count": 10,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Handling files in '/content/drive/MyDrive/Collab Files/donor_dataset/testing' ...\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "100%|██████████| 570/570 [00:05<00:00, 106.77it/s]\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Handling files in '/content/drive/MyDrive/Collab Files/donor_dataset/testing' ...\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "100%|██████████| 570/570 [00:05<00:00, 107.38it/s]\n"
+          ]
+        }
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "### F1-score与混淆矩阵\n",
+        "分别计算F1-score和混淆矩阵。\n",
+        "\n",
+        "混淆矩阵的格式依旧是\n",
+        "```\n",
+        "[[TN    FP]\n",
+        " [FN    TP]]\n",
+        "```\n",
+        "\n",
+        "计算得F1-score为0.721。可以看出，SVM得到了比前一报告中的WAM更高的F1-score，且假阳性率更低。\n"
+      ],
+      "metadata": {
+        "id": "dKQ95or3sbqe"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "f1 = f1_score(test_class, test_pred)\n",
+        "conf_matrix = confusion_matrix(test_class, test_pred)\n",
+        "\n",
+        "print('F1-score: ', f1)\n",
+        "print('Confusion Matrix: ')\n",
+        "print(conf_matrix)"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "sN6uYpIwjWxQ",
+        "outputId": "aa5d466e-de8f-45ee-a739-a7728b68c880"
+      },
+      "execution_count": 11,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "F1-score:  0.7214435879467413\n",
+            "Confusion Matrix: \n",
+            "[[98430  1570]\n",
+            " [   20  2059]]\n"
+          ]
+        }
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "### 结论\n",
+        "虽然需要更长的训练时间，且偶尔会出现一些不符合碱基保守性的结果。但相较于WAM，使用高斯核的SVM获得了相对更好的donor位点识别性能。\n",
+        "\n",
+        "不过显然，SVM在实际应用时的假阳性结果依旧不让人满意，有巨大的改进空间。"
+      ],
+      "metadata": {
+        "id": "Xj32N3hwtTXM"
+      }
+    }
+  ]
+}
